@@ -1,0 +1,311 @@
+// ============================================================================
+// AI Job Application Platform — Prisma Schema
+// Postgres (Supabase). Run: npx prisma migrate dev --name init
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")      // pooled connection (pgbouncer) for runtime
+  directUrl = env("DIRECT_URL")        // direct connection for migrations
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum ResumeStatus {
+  PENDING     // uploaded, not yet parsed
+  PARSING
+  PARSED
+  FAILED
+}
+
+enum ApplicationStatus {
+  WISHLIST
+  APPLIED
+  INTERVIEW
+  OFFER
+  REJECTED
+}
+
+enum AIGenerationType {
+  COVER_LETTER
+  INTERVIEW_QUESTIONS
+  JOB_MATCH
+  RESUME_REVIEW
+}
+
+enum NotificationType {
+  INTERVIEW_REMINDER
+  APPLICATION_FOLLOW_UP
+  ATS_RECHECK_NUDGE
+}
+
+// ---------------------------------------------------------------------------
+// Auth (NextAuth Prisma Adapter shape + app fields)
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  hashedPassword String?  // null when user only uses OAuth
+  role          Role      @default(USER)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  accounts      Account[]
+  sessions      Session[]
+  resumes       Resume[]
+  applications  JobApplication[]
+  aiGenerations AIGeneration[]
+  notifications Notification[]
+
+  @@index([email])
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ---------------------------------------------------------------------------
+// Resume + Parsed Data
+// ---------------------------------------------------------------------------
+
+model Resume {
+  id           String       @id @default(cuid())
+  userId       String
+  fileName     String
+  fileUrl      String       // Supabase Storage path
+  fileType     String       // application/pdf | application/vnd.openxmlformats...
+  status       ResumeStatus @default(PENDING)
+  rawText      String?      @db.Text
+  parseError   String?
+
+  // Structured extraction (denormalized JSON for flexibility + relational
+  // child tables for the parts we need to query/aggregate on)
+  fullName     String?
+  email        String?
+  phone        String?
+  skills       String[]     @default([])
+  summary      String?      @db.Text
+
+  isPrimary    Boolean      @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user          User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  experiences   ResumeExperience[]
+  education     ResumeEducation[]
+  projects      ResumeProject[]
+  atsAnalyses   AtsAnalysis[]
+  applications  JobApplication[]
+  aiGenerations AIGeneration[]
+
+  @@index([userId, status])
+  @@index([userId, createdAt])
+}
+
+model ResumeExperience {
+  id          String   @id @default(cuid())
+  resumeId    String
+  company     String
+  title       String
+  startDate   String?  // free-text, resumes are inconsistent ("Jan 2021")
+  endDate     String?
+  description String?  @db.Text
+  order       Int      @default(0)
+
+  resume Resume @relation(fields: [resumeId], references: [id], onDelete: Cascade)
+
+  @@index([resumeId])
+}
+
+model ResumeEducation {
+  id          String   @id @default(cuid())
+  resumeId    String
+  institution String
+  degree      String?
+  field       String?
+  startDate   String?
+  endDate     String?
+  order       Int      @default(0)
+
+  resume Resume @relation(fields: [resumeId], references: [id], onDelete: Cascade)
+
+  @@index([resumeId])
+}
+
+model ResumeProject {
+  id          String  @id @default(cuid())
+  resumeId    String
+  name        String
+  description String? @db.Text
+  technologies String[] @default([])
+  url         String?
+  order       Int     @default(0)
+
+  resume Resume @relation(fields: [resumeId], references: [id], onDelete: Cascade)
+
+  @@index([resumeId])
+}
+
+// ---------------------------------------------------------------------------
+// ATS Analysis (versioned — one row per analysis run, enables trend charts)
+// ---------------------------------------------------------------------------
+
+model AtsAnalysis {
+  id              String   @id @default(cuid())
+  resumeId        String
+  jobDescription  String?  @db.Text
+  score           Int      // 0-100
+  missingKeywords String[] @default([])
+  matchedKeywords String[] @default([])
+  suggestions     String[] @default([])
+  skillGaps       String[] @default([])
+
+  createdAt DateTime @default(now())
+
+  resume Resume @relation(fields: [resumeId], references: [id], onDelete: Cascade)
+
+  @@index([resumeId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Job Tracker
+// ---------------------------------------------------------------------------
+
+model JobApplication {
+  id             String            @id @default(cuid())
+  userId         String
+  resumeId       String?
+  companyName    String
+  jobTitle       String
+  jobDescription String?           @db.Text
+  jobUrl         String?
+  location       String?
+  status         ApplicationStatus @default(WISHLIST)
+  matchScore     Int?              // cached AI job-match score
+  notes          String?           @db.Text
+  appliedAt      DateTime?
+  interviewAt    DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user          User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  resume        Resume?                  @relation(fields: [resumeId], references: [id], onDelete: SetNull)
+  statusEvents  ApplicationStatusEvent[]
+  notifications Notification[]
+
+  @@index([userId, status])
+  @@index([userId, createdAt])
+}
+
+// Append-only audit trail of status transitions — powers "time in stage" and
+// weekly-activity dashboard widgets without re-deriving from updatedAt.
+model ApplicationStatusEvent {
+  id            String            @id @default(cuid())
+  applicationId String
+  fromStatus    ApplicationStatus?
+  toStatus      ApplicationStatus
+  changedAt     DateTime          @default(now())
+
+  application JobApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId, changedAt])
+}
+
+// ---------------------------------------------------------------------------
+// AI Generation Log (auditable + cacheable)
+// ---------------------------------------------------------------------------
+
+model AIGeneration {
+  id           String           @id @default(cuid())
+  userId       String
+  resumeId     String?
+  type         AIGenerationType
+  inputHash    String           // sha256 of normalized inputs, for cache lookup
+  prompt       String           @db.Text
+  response     String           @db.Text
+  promptTokens Int?
+  completionTokens Int?
+
+  createdAt DateTime @default(now())
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  resume Resume? @relation(fields: [resumeId], references: [id], onDelete: SetNull)
+
+  @@index([userId, type, createdAt])
+  @@unique([userId, type, inputHash]) // cache key — avoid re-billing OpenAI
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id            String            @id @default(cuid())
+  userId        String
+  applicationId String?
+  type          NotificationType
+  scheduledFor  DateTime
+  sentAt        DateTime?
+  failedAt      DateTime?
+  payload       Json?
+
+  createdAt DateTime @default(now())
+
+  user        User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  application JobApplication? @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([scheduledFor, sentAt]) // cron scan: WHERE sentAt IS NULL AND scheduledFor <= now()
+}
